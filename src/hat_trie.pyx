@@ -1,13 +1,118 @@
-# cython: profile=True
+# cython: c__stringype=str, c_string_encoding=utf8
 
-from libc.math cimport NAN
 from chat_trie cimport *
+from cpython.version cimport PY_MAJOR_VERSION
 
 cimport cpython
+cimport cython
+
+# TODO: Try this at compile-time?
+assert sizeof(long) <= sizeof(value_t)
+assert sizeof(double) <= sizeof(value_t)
+
+cdef inline char* _asbytes(basestring key):
+    if isinstance(key, unicode):
+        return (<unicode> key).encode('UTF-8')
+    else:
+        return <bytes> key
+
+cdef inline value_t* _tryget(hattrie_t* trie, basestring key):
+    cdef ssize_t c_keylen = len(key)
+    cdef char* c_key = _asbytes(key)
+    cdef value_t* value_ptr
+    value_ptr = hattrie_tryget(trie, c_key, c_keylen)
+    return value_ptr
+
+cdef inline _set(hattrie_t* trie, basestring key, value_t value):
+    cdef ssize_t c_keylen = len(key)
+    cdef char* c_key = _asbytes(key)
+    hattrie_get(trie, c_key, c_keylen)[0] = value
+
+cdef inline value_t _setdefault(hattrie_t* trie, basestring key, value_t value):
+    cdef ssize_t c_keylen = len(key)
+    cdef char* c_key = _asbytes(key)
+    cdef value_t* value_ptr
+    value_ptr = hattrie_tryget(trie, c_key, c_keylen)
+    if value_ptr == NULL:
+        hattrie_get(trie, c_key, c_keylen)[0] = value
+    else:
+        value = value_ptr[0]
+    return value
+
+
+cdef class BaseTrie
+
+
+@cython.no_gc_clear
+cdef class Iterable:
+
+    cdef BaseTrie _parent
+    cdef hattrie_iter_t* _it
+    cdef readonly bint ordered
+
+    def __cinit__(self, BaseTrie parent, bint ordered=False):
+        self._parent = parent
+        self.ordered = ordered
+
+    def __dealloc__(self):
+        if self._it != NULL:
+            hattrie_iter_free(self._it)
+            self._it = NULL
+            self._parent = None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+
+        if self._parent is None:
+            raise StopIteration
+
+        elif self._it == NULL:
+            self._it = hattrie_iter_begin(self._parent._trie, self.ordered)
+
+        else:
+            hattrie_iter_next(self._it)
+
+        if hattrie_iter_finished(self._it):
+            hattrie_iter_free(self._it)
+            self._it = NULL
+            self._parent = None
+            raise StopIteration
+
+        return self._nextvalue()
+
+    def _nextvalue(self):
+        cdef size_t c_keylen
+        cdef char* c_key
+        c_key = hattrie_iter_key(self._it, &c_keylen)
+        return c_key[:c_keylen]
+
+
+cdef class ValueIterable(Iterable):
+
+    def _nextvalue(self):
+        cdef value_t* value_ptr
+        value_ptr = hattrie_iter_val(self._it)
+        return self._parent._fromvalue(value_ptr[0])
+
+
+cdef class ItemIterable(Iterable):
+
+    def _nextvalue(self):
+        cdef:
+            size_t c_keylen
+            char* c_key
+            value_t* value_ptr
+        c_key = hattrie_iter_key(self._it, &c_keylen)
+        value_ptr = hattrie_iter_val(self._it)
+        value = self._parent._fromvalue(value_ptr[0])
+        return c_key[:c_keylen], value
+
 
 cdef class BaseTrie:
     """
-    Base HAT-Trie wrapper.
+    HAT-Trie with unicode keys and int values.
     """
 
     cdef hattrie_t* _trie
@@ -16,72 +121,106 @@ cdef class BaseTrie:
         self._trie = hattrie_create()
 
     def __dealloc__(self):
-        if self._trie:
+        if self._trie != NULL:
             hattrie_free(self._trie)
+            self._trie = NULL
 
+    def __delitem__(self, basestring key not None):
+        cdef ssize_t c_keylen = len(key)
+        cdef char* c_key = _asbytes(key)
+        if hattrie_del(self._trie, c_key, c_keylen) != 0:
+            raise KeyError(key)
 
-    def __getitem__(self, bytes key):
-        return self._getitem(key)
+    def __contains__(self, basestring key not None):
+        return _tryget(self._trie, key) != NULL
 
-    def __setitem__(self, bytes key, int value):
-        self._setitem(key, value)
-
-    def __contains__(self, bytes key):
-        return self._contains(key)
+    def __iter__(self):
+        return self.iterkeys()
 
     def __len__(self):
         return hattrie_size(self._trie)
 
-    def get(self, bytes key, value=-1):
-        try:
-            return self._getitem(key)
-        except KeyError:
-            return value
+    def clear(self):
+        hattrie_clear(self._trie)
 
-    def setdefault(self, bytes key, int value):
-        return self._setdefault(key, value)
+    # TODO: Enable after implemented in C or remove.
+    # def copy(self):
+    #     new_trie = BaseTrie()
+    #     new_trie._trie = hattrie_dup(self._trie)
+    #     return new_trie
 
-    def keys(self):
-        return list(self.iterkeys())
+    def has_key(self, basestring key not None):
+        return _tryget(self._trie, key) != NULL
 
-    def iterkeys(self):
-        cdef:
-            hattrie_iter_t* it = hattrie_iter_begin(self._trie, 0)
-            char* c_key
-            size_t val
-            size_t length
-            bytes py_str
+    def iterkeys(self, bint ordered=False):
+        return Iterable(self, ordered)
 
-        try:
+    def itervalues(self, bint ordered=False):
+        return ValueIterable(self, ordered)
+
+    def iteritems(self, bint ordered=False):
+        return ItemIterable(self, ordered)
+
+    if PY_MAJOR_VERSION >= 3:
+
+        keys = iterkeys
+        values = itervalues
+        items = iteritems
+
+    else:
+
+        def keys(self, bint ordered=False):
+            cdef:
+                hattrie_iter_t* it
+                size_t c_keylen
+                char* c_key
+
+            keylist = []
+            it = hattrie_iter_begin(self._trie, ordered)
             while not hattrie_iter_finished(it):
-                c_key = hattrie_iter_key(it, &length)
-                py_str = c_key[:length]
-                yield py_str
+                c_key = hattrie_iter_key(it, &c_keylen)
+                keylist.append(<str> c_key[:c_keylen])
                 hattrie_iter_next(it)
 
-        finally:
             hattrie_iter_free(it)
+            return keylist
 
+        def items(self, bint ordered=False):
+            cdef:
+                hattrie_iter_t* it
+                size_t c_keylen
+                char* c_key
+                value_t* value_ptr
 
-    cdef value_t _getitem(self, char* key) except -1:
-        cdef value_t* value_ptr = hattrie_tryget(self._trie, key, len(key))
-        if value_ptr == NULL:
-            raise KeyError(key)
-        return value_ptr[0]
+            itemlist = []
+            it = hattrie_iter_begin(self._trie, ordered)
+            while not hattrie_iter_finished(it):
+                c_key = hattrie_iter_key(it, &c_keylen)
+                value_ptr = hattrie_iter_val(it)
+                item = <str> c_key[:c_keylen], self._fromvalue(value_ptr[0])
+                itemlist.append(item)
+                hattrie_iter_next(it)
 
-    cdef void _setitem(self, char* key, value_t value):
-        hattrie_get(self._trie, key, len(key))[0] = value
+            hattrie_iter_free(it)
+            return itemlist
 
-    cdef value_t _setdefault(self, char* key, value_t value):
-        cdef value_t* value_ptr = hattrie_tryget(self._trie, key, len(key))
-        if value_ptr == NULL:
-            self._setitem(key, value)
-            return value
-        return value_ptr[0]
+        def values(self, bint ordered=False):
+            cdef:
+                hattrie_iter_t* it
+                value_t* value_ptr
 
-    cdef bint _contains(self, char* key):
-        cdef value_t* value_ptr = hattrie_tryget(self._trie, key, len(key))
-        return value_ptr != NULL
+            valuelist = []
+            it = hattrie_iter_begin(self._trie, ordered)
+            while not hattrie_iter_finished(it):
+                value_ptr = hattrie_iter_val(it)
+                valuelist.append(self._fromvalue(value_ptr[0]))
+                hattrie_iter_next(it)
+
+            hattrie_iter_free(it)
+            return valuelist
+
+    cdef _fromvalue(self, value_t value):
+        return value
 
 
 cdef class IntTrie(BaseTrie):
@@ -89,51 +228,24 @@ cdef class IntTrie(BaseTrie):
     HAT-Trie with unicode support that stores int as value.
     """
 
-    # XXX: Internal encoding is hardcoded as UTF8. This is the fastest
-    # encoding that can handle all unicode symbols and doesn't have
-    # zero bytes.
+    def __getitem__(self, basestring key not None):
+        cdef value_t* value_ptr = _tryget(self._trie, key)
+        if value_ptr == NULL:
+            raise KeyError(key)
+        return <long> value_ptr[0]
 
-    # This may seem sub-optimal because it is multibyte encoding;
-    # single-byte language-specific encoding (such as cp1251)
-    # seems to be faster. But this is not the case because:
+    def __setitem__(self, basestring key not None, long value):
+        _set(self._trie, key, <value_t> value)
 
-    # 1) the bottleneck of this wrapper is string encoding, not trie traversal;
-    # 2) python's unicode encoding utilities are optimized for utf8;
-    # 3) users will have to select language-specific encoding for the trie;
-    # 4) non-hardcoded encoding causes extra overhead and prevents cython
-    #    optimizations.
+    def get(self, basestring key not None, value=None):
+        cdef value_t* value_ptr = _tryget(self._trie, key)
+        return value if value_ptr == NULL else (<long*> value_ptr)[0]
 
-    # That's why hardcoded utf8 is up to 9 times faster than configurable cp1251.
+    def setdefault(self, basestring key not None, long value=0):
+        return <long> _setdefault(self._trie, key, <value_t> value)
 
-    # XXX: char-walking utilities may become tricky with multibyte
-    # internal encoding.
-
-    def __getitem__(self, unicode key):
-        cdef bytes bkey = key.encode('utf8')
-        return self._getitem(bkey)
-
-    def __contains__(self, unicode key):
-        cdef bytes bkey = key.encode('utf8')
-        return self._contains(bkey)
-
-    def __setitem__(self, unicode key, int value):
-        cdef bytes bkey = key.encode('utf8')
-        self._setitem(bkey, value)
-
-    def get(self, unicode key, value=-1):
-        cdef bytes bkey = key.encode('utf8')
-        try:
-            return self._getitem(bkey)
-        except KeyError:
-            return value
-
-    def setdefault(self, unicode key, int value):
-        cdef bytes bkey = key.encode('utf8')
-        return self._setdefault(bkey, value)
-
-    def iterkeys(self):
-        for key in BaseTrie.iterkeys(self):
-            yield key.decode('utf8')
+    cdef _fromvalue(self, value_t value):
+        return <long> value
 
 
 cdef class FloatTrie(BaseTrie):
@@ -141,45 +253,24 @@ cdef class FloatTrie(BaseTrie):
     HAT-Trie with unicode support that stores float as value.
     """
 
-    # XXX: uintptr_t is interpreted as a float32. This should work on all
-    # systems with 32-bit or larger pointers, e.g. the majority of modern
-    # computers. This will likely not work on embedded 8- and 16-bit
-    # systems.
+    def __getitem__(self, basestring key not None):
+        cdef value_t* value_ptr = _tryget(self._trie, key)
+        if value_ptr == NULL:
+            raise KeyError(key)
+        return (<double*> value_ptr)[0]
 
-    def __getitem__(self, unicode key):
-        cdef bytes bkey = key.encode('utf8')
-        return self._fromvalue(self._getitem(bkey))
+    def __setitem__(self, basestring key not None, double value):
+        _set(self._trie, key, <value_t> (<value_t*> &value)[0])
 
-    def __contains__(self, unicode key):
-        cdef bytes bkey = key.encode('utf8')
-        return self._contains(bkey)
+    def get(self, basestring key not None, value=None):
+        cdef value_t* value_ptr = _tryget(self._trie, key)
+        return value if value_ptr == NULL else (<double*> value_ptr)[0]
 
-    def __setitem__(self, unicode key, float value):
-        cdef bytes bkey = key.encode('utf8')
-        self._setitem(bkey, self._tovalue(value))
+    def setdefault(self, basestring key not None, double value=0.0):
+        return <double> _setdefault(self._trie, key, (<value_t*> &value)[0])
 
-    def get(self, unicode key, value=float('nan')):
-        cdef bytes bkey = key.encode('utf8')
-        try:
-            return self._fromvalue(self._getitem(bkey))
-        except KeyError:
-            return value
-
-    def setdefault(self, unicode key, float value):
-        cdef bytes bkey = key.encode('utf8')
-        return self._fromvalue(self._setdefault(bkey, self._tovalue(value)))
-
-    def iterkeys(self):
-        for key in BaseTrie.iterkeys(self):
-            yield key.decode('utf8')
-
-    cdef float _fromvalue(self, value_t value):
-        cdef float* float_ptr = <float *> &value
-        return float_ptr[0]
-
-    cdef value_t _tovalue(self, float value):
-        cdef value_t* value_ptr = <value_t *> &value
-        return value_ptr[0]
+    cdef _fromvalue(self, value_t value):
+        return <double> value
 
 
 cdef class Trie(BaseTrie):
@@ -187,65 +278,72 @@ cdef class Trie(BaseTrie):
     HAT-Trie with unicode support and arbitrary values.
     """
 
-    # XXX: Internal encoding is hardcoded as UTF8. See note in IntTrie
-    # for more details.
-
     def __dealloc__(self):
         cdef hattrie_iter_t* it = hattrie_iter_begin(self._trie, 0)
-        cdef cpython.PyObject *o
+        cdef cpython.PyObject *pyobj
 
         try:
             while not hattrie_iter_finished(it):
-                o = <cpython.PyObject *> hattrie_iter_val(it)[0]
-                cpython.Py_XDECREF(o)
+                pyobj = <cpython.PyObject*> hattrie_iter_val(it)[0]
+                cpython.Py_XDECREF(pyobj)
                 hattrie_iter_next(it)
 
         finally:
             hattrie_iter_free(it)
 
+    def __getitem__(self, basestring key not None):
+        cdef cpython.PyObject* pyobj
+        cdef value_t* value_ptr = _tryget(self._trie, key)
+        if value_ptr == NULL:
+            raise KeyError(key)
+        pyobj = <cpython.PyObject*> value_ptr[0]
+        return <object> pyobj
 
-    def __getitem__(self, unicode key):
-        cdef bytes bkey = key.encode('utf8')
-        return self._fromvalue(self._getitem(bkey))
-
-    def __contains__(self, unicode key):
-        cdef bytes bkey = key.encode('utf8')
-        return self._contains(bkey)
-
-    def __setitem__(self, unicode key, value):
-        cdef bytes bkey = key.encode('utf8')
-        self._setitem(bkey, self._tovalue(value))
-
-    def get(self, unicode key, value=None):
-        cdef bytes bkey = key.encode('utf8')
-        try:
-            return self._fromvalue(self._getitem(bkey))
-        except KeyError:
-            return value
-
-    def setdefault(self, unicode key, value):
-        cdef bytes bkey = key.encode('utf8')
-        return self._setdefault(bkey, self._tovalue(value))
-
-    def iterkeys(self):
-        for key in BaseTrie.iterkeys(self):
-            yield key.decode('utf8')
-
-    cdef void _setitem(self, char* key, value_t value):
-        cdef cpython.PyObject *o
-        cdef value_t* value_ptr = hattrie_tryget(self._trie, key, len(key))
+    def __setitem__(self, basestring key not None, object value):
+        cdef cpython.PyObject* pyobj
+        cdef ssize_t c_keylen = len(key)
+        cdef char* c_key = _asbytes(key)
+        cdef value_t* value_ptr = hattrie_tryget(self._trie, c_key, c_keylen)
         if value_ptr != NULL:
-            o = <cpython.PyObject *> value_ptr[0]
-            cpython.Py_XDECREF(o)
-        hattrie_get(self._trie, key, len(key))[0] = value
+            pyobj = <cpython.PyObject*> value_ptr[0]
+            cpython.Py_XDECREF(pyobj)
+        else:
+            value_ptr = hattrie_get(self._trie, c_key, c_keylen)
+        pyobj = <cpython.PyObject*> value
+        cpython.Py_XINCREF(pyobj)
+        value_ptr[0] = <value_t> pyobj
 
-    cdef object _fromvalue(self, value_t value):
-        cdef cpython.PyObject *o
-        o = <cpython.PyObject *> value
-        return <object> o
+    def __delitem__(self, basestring key not None):
+        cdef ssize_t c_keylen = len(key)
+        cdef char* c_key = _asbytes(key)
+        cdef value_t* value_ptr = hattrie_tryget(self._trie, c_key, c_keylen)
+        if value_ptr == NULL or hattrie_del(self._trie, c_key, len(key)) != 0:
+            raise KeyError(key)
+        if value_ptr != NULL:
+            cpython.Py_XDECREF(<cpython.PyObject*> value_ptr[0])
 
-    cdef value_t _tovalue(self, object obj):
-        cdef cpython.PyObject *o
-        o = <cpython.PyObject *> obj
-        cpython.Py_XINCREF(o)
-        return <value_t> o
+    def get(self, basestring key not None, value=None):
+        cdef cpython.PyObject* pyobj
+        cdef value_t* value_ptr = _tryget(self._trie, key)
+        if value_ptr == NULL:
+            return value
+        pyobj = <cpython.PyObject*> value_ptr[0]
+        return <object> pyobj
+
+    def setdefault(self, basestring key not None, object value=None):
+        cdef cpython.PyObject* pyobj
+        cdef ssize_t c_keylen = len(key)
+        cdef char* c_key = _asbytes(key)
+        cdef value_t* value_ptr = hattrie_tryget(self._trie, c_key, c_keylen)
+        if value_ptr != NULL:
+            pyobj = <cpython.PyObject*> value_ptr[0]
+            value = <object> pyobj
+        else:
+            pyobj = <cpython.PyObject*> value
+            cpython.Py_XINCREF(pyobj)
+            hattrie_get(self._trie, c_key, c_keylen)[0] = <value_t> pyobj
+        return value
+
+    cdef _fromvalue(self, value_t value):
+        cdef cpython.PyObject* pyobj = <cpython.PyObject*> value
+        return <object> pyobj
